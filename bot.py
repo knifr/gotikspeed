@@ -2,8 +2,8 @@
 
 Логика:
   • аудиофайл (mp3, m4a, wav...)   -> меню эффектов: speed up / slowed, reverb, 8D
-  • голосовое, видео, кружок       -> поиск песни (Shazam)
-  • ссылка на видео/трек           -> поиск песни (Shazam)
+  • голосовое, видео, кружок       -> поиск песни (Shazam) + отправка mp3
+  • ссылка на видео/трек           -> поиск песни (Shazam) + отправка mp3
   • обычный текст                  -> поиск по названию
 """
 import asyncio
@@ -175,6 +175,32 @@ def _download_from_url(url: str, out_dir: str) -> Path:
     return files[0]
 
 
+def _download_by_query(query: str, out_dir: str) -> Path | None:
+    """Качает первый результат поиска YouTube по запросу 'artist title' в mp3."""
+    opts = {
+        "format": "bestaudio/best",
+        "outtmpl": os.path.join(out_dir, "found.%(ext)s"),
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "default_search": "ytsearch1",
+        "max_filesize": 100 * 1024 * 1024,
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        }],
+    }
+    try:
+        with YoutubeDL(opts) as ydl:
+            ydl.extract_info(query, download=True)
+    except Exception:
+        logging.exception("download by query failed")
+        return None
+    files = [p for p in Path(out_dir).glob("found.*") if p.suffix != ".part"]
+    return files[0] if files else None
+
+
 def _search_youtube(query: str) -> list[dict]:
     with YoutubeDL({"quiet": True, "no_warnings": True, "extract_flat": True}) as ydl:
         info = ydl.extract_info(f"ytsearch5:{query}", download=False)
@@ -199,13 +225,33 @@ def format_track(track: dict) -> str:
     return text + links_block(artist, title)
 
 
-async def recognize_file(path: Path) -> str | None:
+async def recognize_track(path: Path) -> dict | None:
     with tempfile.TemporaryDirectory() as tmp:
         sample = Path(tmp) / "sample.wav"
         await make_sample(path, sample)
         result = await shazam.recognize(str(sample))
-    track = result.get("track")
-    return format_track(track) if track else None
+    return result.get("track")
+
+
+async def send_recognized(message: Message, status: Message, track: dict) -> bool:
+    """Пробует скачать трек и отправить mp3. Возвращает True, если отправил."""
+    caption = format_track(track)
+    artist = track.get("subtitle", "")
+    title = track.get("title", "")
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = await asyncio.to_thread(
+            _download_by_query, f"{artist} {title}".strip(), tmp
+        )
+        if not audio or audio.stat().st_size > MAX_TG_UPLOAD:
+            return False
+        await status.edit_text("🎵 Нашёл! Отправляю файл...")
+        await message.reply_audio(
+            FSInputFile(audio, filename=f"{artist} - {title}.mp3"),
+            title=title, performer=artist,
+            caption=caption, parse_mode=ParseMode.HTML,
+        )
+    await status.delete()
+    return True
 
 
 # =====================  ХЕНДЛЕРЫ  =====================
@@ -245,14 +291,19 @@ async def on_media_recognize(message: Message, bot: Bot):
         with tempfile.TemporaryDirectory() as tmp:
             src = Path(tmp) / "input"
             await bot.download(media.file_id, destination=src)
-            answer = await recognize_file(src)
+            track = await recognize_track(src)
+        if not track:
+            await status.edit_text("😕 Не смог узнать трек. Попробуй фрагмент, где музыка слышна чётче.")
+            return
+        sent = await send_recognized(message, status, track)
+        if not sent:
+            await status.edit_text(
+                format_track(track) + "\n\n⚠️ Файл скачать не удалось — вот ссылки.",
+                disable_web_page_preview=True,
+            )
     except Exception:
         logging.exception("media error")
-        answer = "⚠️ Не получилось обработать файл."
-    await status.edit_text(
-        answer or "😕 Не смог узнать трек. Попробуй фрагмент, где музыка слышна чётче.",
-        disable_web_page_preview=True,
-    )
+        await status.edit_text("⚠️ Не получилось обработать файл.")
 
 
 # ---- текст: ручная скорость / ссылка / поиск по названию ----
@@ -282,8 +333,14 @@ async def on_text(message: Message):
         if url_match:                                # ссылка -> распознаём
             with tempfile.TemporaryDirectory() as tmp:
                 path = await asyncio.to_thread(_download_from_url, url_match.group(0), tmp)
-                answer = await recognize_file(path)
-            answer = answer or "😕 Не смог узнать трек по этой ссылке."
+                track = await recognize_track(path)
+            if track:
+                sent = await send_recognized(message, status, track)
+                if sent:
+                    return
+                answer = format_track(track) + "\n\n⚠️ Файл скачать не удалось — вот ссылки."
+            else:
+                answer = "😕 Не смог узнать трек по этой ссылке."
         else:                                        # название -> поиск
             entries = await asyncio.to_thread(_search_youtube, text)
             if not entries:
