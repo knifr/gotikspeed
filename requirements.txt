@@ -1,0 +1,4 @@
+aiogram>=3.7,<4
+shazamio>=0.6
+yt-dlp
+python-dotenv
