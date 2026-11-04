@@ -1,9 +1,13 @@
 # Render Blueprint: Background Worker (long polling).
-# Токен вводится в панели Render, в репозиторий его не кладём.
+# Значения переменных вводятся в панели Render, в репозиторий их не кладём.
 services:
   - type: worker
     name: music-finder-bot
     runtime: docker
     envVars:
       - key: BOT_TOKEN
+        sync: false
+      - key: CHANNEL_ID
+        sync: false
+      - key: ADMIN_IDS
         sync: false
