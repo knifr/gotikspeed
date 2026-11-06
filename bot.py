@@ -1,10 +1,10 @@
-"""Telegram-бот: поиск песен, эффекты, теги, посты в канал.
+"""Telegram-бот: поиск песен, эффекты, теги и обложка, посты в канал.
 
 Автоопределение:
-  • аудиофайл                    -> эффекты (speed up / slowed, reverb, 8D) + изменение тегов
+  • аудиофайл                    -> эффекты (speed up / slowed, reverb, 8D), теги, обложка
   • голосовое / видео / кружок   -> поиск песни и отправка аудиофайла
   • ссылка                       -> поиск песни и отправка аудиофайла
-  • текст                        -> поиск по названию (выбор из списка кнопок)
+  • текст                        -> сразу присылает найденный трек + другие варианты кнопками
   • /start                       -> меню функций, /post -> пост в канал
 """
 import asyncio
@@ -17,8 +17,8 @@ import tempfile
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import quote_plus
 
+import aiohttp
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -57,6 +57,12 @@ TIPOKE_URL = "https://t.me/tipokeee"
 CAPTION = (f'<a href="{SPEEDUP_URL}">Speed Up Audio</a> | '
            f'<a href="{TIPOKE_URL}">Tipoke Music</a>')
 
+# Где искать аудио, по порядку. Если источник не работает, бот пробует следующий.
+PREFIX = {"youtube": "ytsearch", "soundcloud": "scsearch"}
+SOURCES = [s.strip() for s in os.getenv("SEARCH_SOURCES", "youtube,soundcloud").split(",")
+           if s.strip() in PREFIX] or ["youtube", "soundcloud"]
+ICON = {"youtube": "▶️", "soundcloud": "☁️"}
+
 # Куки для yt-dlp (нужны, если YouTube блокирует серверный IP). Путь к файлу cookies.txt
 COOKIES_TMP = None
 _cookies_src = os.getenv("COOKIES_FILE")
@@ -80,12 +86,17 @@ shazam = Shazam()
 class Fx(StatesGroup):
     custom_speed = State()
     tags = State()
+    cover = State()
 
 
 class Post(StatesGroup):
     content = State()
     buttons = State()
     confirm = State()
+
+
+class TrackSkipped(Exception):
+    """Трек не подошёл (слишком длинный и т.п.), сам источник при этом работает."""
 
 
 # =====================  ОБЩИЕ УТИЛИТЫ  =====================
@@ -115,10 +126,23 @@ def meta_args(title: str, artist: str) -> list[str]:
     return args
 
 
-async def retag(src: Path, dst: Path, title: str, artist: str, copy: bool = True) -> None:
-    """Меняет теги. copy=True — без перекодирования (только для mp3)."""
+def cover_map_args(cover: Path | None, keep: bool = True) -> list[str]:
+    """Обложка: новая (вторым входом), старая из файла или никакой."""
+    if cover:
+        return ["-map", "1:0", "-c:v", "copy",
+                "-metadata:s:v", "title=Album cover", "-metadata:s:v", "comment=Cover (front)"]
+    if keep:
+        return ["-map", "0:v:0?", "-c:v", "copy"]
+    return []
+
+
+async def retag(src: Path, dst: Path, title: str, artist: str, copy: bool = True,
+                cover: Path | None = None, keep_cover: bool = True) -> None:
+    """Меняет теги и обложку. copy=True — звук без перекодирования (только для mp3)."""
+    inputs = ["-i", str(src)] + (["-i", str(cover)] if cover else [])
     codec = ["-c:a", "copy"] if copy else ["-c:a", "libmp3lame", "-b:a", "256k"]
-    await run_ffmpeg("-i", str(src), "-map", "0:a:0", *codec, *meta_args(title, artist), str(dst))
+    await run_ffmpeg(*inputs, "-map", "0:a:0", *cover_map_args(cover, keep_cover),
+                     *codec, *meta_args(title, artist), str(dst))
 
 
 def safe_name(name: str) -> str:
@@ -139,7 +163,7 @@ def parse_artist_title(text: str, default_artist: str = "") -> tuple[str, str]:
 
 
 def guess_tags(info: dict) -> tuple[str, str]:
-    """Название и исполнитель из метаданных YouTube."""
+    """Название и исполнитель из метаданных источника."""
     title = clean_title(info.get("track") or info.get("title") or "Track")
     artist = info.get("artist") or ""
     if not artist:
@@ -150,7 +174,51 @@ def guess_tags(info: dict) -> tuple[str, str]:
     return title, artist
 
 
-async def send_mp3(target: Message, mp3: Path, title: str, artist: str) -> bool:
+def explain_error(e: Exception) -> str:
+    s = str(e)
+    if "Sign in to confirm" in s or "not a bot" in s:
+        return "YouTube блокирует сервер (нужны cookies, см. README)"
+    first = s.strip().splitlines()[0] if s.strip() else type(e).__name__
+    return first[:160]
+
+
+# ---------- обложки ----------
+
+async def fetch_image(url: str, dst: Path) -> bool:
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as sess:
+            async with sess.get(url) as r:
+                if r.status != 200:
+                    return False
+                dst.write_bytes(await r.read())
+                return True
+    except Exception:
+        logging.warning("cover download failed", exc_info=True)
+        return False
+
+
+async def make_square_jpg(raw: Path, dst: Path, size: int) -> None:
+    vf = f"crop='min(iw,ih)':'min(iw,ih)',scale={size}:{size}"
+    await run_ffmpeg("-i", str(raw), "-vf", vf, "-frames:v", "1", "-q:v", "3", str(dst))
+
+
+async def prepare_cover(raw: Path, tmp: Path) -> tuple[Path | None, Path | None]:
+    """Из любой картинки делает квадратную обложку (600 px) и миниатюру для Telegram (320 px)."""
+    cover, thumb = tmp / "cover.jpg", tmp / "thumb.jpg"
+    try:
+        await make_square_jpg(raw, cover, 600)
+        await make_square_jpg(raw, thumb, 320)
+        return cover, thumb
+    except Exception:
+        logging.warning("cover prepare failed", exc_info=True)
+        return None, None
+
+
+# ---------- отправка ----------
+
+async def send_mp3(target: Message, mp3: Path, title: str, artist: str,
+                   thumb: Path | None = None) -> bool:
     """Отправляет mp3 с подписью-ссылками. Возвращает False, если файл слишком большой."""
     if mp3.stat().st_size > MAX_TG_UPLOAD:
         await target.answer("⚠️ Файл больше 50 МБ, Telegram не даёт его отправить.")
@@ -159,11 +227,31 @@ async def send_mp3(target: Message, mp3: Path, title: str, artist: str) -> bool:
     await target.answer_audio(
         FSInputFile(mp3, filename=f"{name}.mp3"),
         title=title, performer=artist or None, caption=CAPTION,
+        thumbnail=FSInputFile(thumb) if thumb else None,
     )
     return True
 
 
-# =====================  ЭФФЕКТЫ И ТЕГИ  =====================
+async def finalize_and_send(target: Message, tmp: str, mp3: Path, title: str, artist: str,
+                            cover_url: str | None = None) -> bool:
+    """Вшивает теги и обложку в скачанный mp3 и отправляет."""
+    tmp_dir = Path(tmp)
+    cover = thumb = None
+    if cover_url:
+        raw = tmp_dir / "cover_raw"
+        if await fetch_image(cover_url, raw):
+            cover, thumb = await prepare_cover(raw, tmp_dir)
+    final = tmp_dir / "final.mp3"
+    try:
+        await retag(mp3, final, title, artist, cover=cover)
+    except Exception:
+        logging.warning("retag with cover failed, retry without", exc_info=True)
+        thumb = None
+        await retag(mp3, final, title, artist, keep_cover=False)
+    return await send_mp3(target, final, title, artist, thumb)
+
+
+# =====================  ЭФФЕКТЫ, ТЕГИ, ОБЛОЖКА  =====================
 
 @dataclass
 class Session:
@@ -175,7 +263,8 @@ class Session:
     speed: float = 1.0
     reverb: bool = False
     eightd: bool = False
-    tags_changed: bool = False
+    tags_changed: bool = False          # менялись теги или обложка
+    cover_file_id: str | None = None
 
     @property
     def has_effects(self) -> bool:
@@ -211,7 +300,11 @@ def effects_kb(sid: str, s: Session) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text=f"🌊 Reverb {'✅' if s.reverb else '⬜'}", callback_data=f"fx:{sid}:rev"),
         InlineKeyboardButton(text=f"🎧 8D {'✅' if s.eightd else '⬜'}", callback_data=f"fx:{sid}:8d"),
     )
-    b.row(InlineKeyboardButton(text="🏷 Изменить теги", callback_data=f"fx:{sid}:tags"))
+    b.row(
+        InlineKeyboardButton(text="🏷 Теги", callback_data=f"fx:{sid}:tags"),
+        InlineKeyboardButton(text=f"🖼 Обложка {'✅' if s.cover_file_id else ''}".strip(),
+                             callback_data=f"fx:{sid}:cover"),
+    )
     b.row(InlineKeyboardButton(text="▶️ Создать", callback_data=f"fx:{sid}:go"))
     return b.as_markup()
 
@@ -226,11 +319,12 @@ def menu_text(s: Session) -> str:
     return (
         "🎛 <b>Выбери эффекты</b>\n\n"
         f"🏷 Теги: <b>{html.escape(s.artist or '—')}</b> — <b>{html.escape(s.title)}</b>\n"
+        f"🖼 Обложка: <b>{'новая' if s.cover_file_id else 'как в файле'}</b>\n"
         f"⏱ Скорость: <b>{speed}</b>\n"
         f"🌊 Reverb: <b>{'вкл' if s.reverb else 'выкл'}</b>\n"
         f"🎧 8D: <b>{'вкл' if s.eightd else 'выкл'}</b> (слушай в наушниках)\n\n"
         "Скорость меняет и тон, как в обычных slowed / sped up ремиксах. "
-        "Эффекты можно комбинировать. Можно изменить только теги, без эффектов. "
+        "Эффекты можно комбинировать. Теги и обложку можно менять и без эффектов. "
         "Потом жми «Создать»."
     )
 
@@ -247,8 +341,11 @@ def build_filter(s: Session) -> str:
     return ",".join(f)
 
 
-async def apply_effects(src: Path, dst: Path, s: Session) -> None:
-    await run_ffmpeg("-i", str(src), "-vn", "-ac", "2", "-af", build_filter(s),
+async def apply_effects(src: Path, dst: Path, s: Session, cover: Path | None = None,
+                        keep_cover: bool = True) -> None:
+    inputs = ["-i", str(src)] + (["-i", str(cover)] if cover else [])
+    await run_ffmpeg(*inputs, "-map", "0:a:0", *cover_map_args(cover, keep_cover),
+                     "-ac", "2", "-af", build_filter(s),
                      "-c:a", "libmp3lame", "-b:a", "192k", *meta_args(s.title, s.artist), str(dst))
 
 
@@ -273,21 +370,28 @@ def _download_from_url(url: str, out_dir: str) -> Path:
     return files[0]
 
 
-def _search_youtube(query: str) -> list[dict]:
-    with YoutubeDL(ydl_opts(extract_flat=True)) as ydl:
-        info = ydl.extract_info(f"ytsearch5:{query}", download=False)
-    return [e for e in (info.get("entries", []) if info else []) if e.get("id")]
+def _search(query: str, per_source: int = 3) -> list[dict]:
+    """Ищет аудио во всех источниках: сначала YouTube, потом SoundCloud."""
+    results: list[dict] = []
+    for src in SOURCES:
+        try:
+            with YoutubeDL(ydl_opts(extract_flat=True)) as ydl:
+                info = ydl.extract_info(f"{PREFIX[src]}{per_source}:{query}", download=False)
+            for e in (info.get("entries") or []) if info else []:
+                if e and (e.get("url") or e.get("id")):
+                    e["_src"] = src
+                    results.append(e)
+        except Exception:
+            logging.exception("search failed: %s", src)
+    return results
 
 
-def _find_video_id(query: str) -> str | None:
-    for e in _search_youtube(query):
-        d = e.get("duration")
-        if d is None or d <= MAX_TRACK_DURATION:
-            return e["id"]
-    return None
+def entry_url(e: dict) -> str:
+    u = e.get("url") or ""
+    return u if u.startswith("http") else f"https://www.youtube.com/watch?v={e['id']}"
 
 
-def _download_mp3(video_id: str, out_dir: str) -> tuple[Path, dict]:
+def _download_mp3(url: str, out_dir: str) -> tuple[Path, dict]:
     """Скачивает аудио целиком и конвертирует в mp3."""
     opts = ydl_opts(
         format="bestaudio/best", outtmpl=os.path.join(out_dir, "track.%(ext)s"), noplaylist=True,
@@ -296,14 +400,65 @@ def _download_mp3(video_id: str, out_dir: str) -> tuple[Path, dict]:
         postprocessors=[{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
     )
     with YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
+        info = ydl.extract_info(url, download=True)
     mp3 = Path(out_dir) / "track.mp3"
     if not mp3.exists():
-        raise RuntimeError("Не удалось скачать (трек слишком длинный или недоступен)")
+        raise TrackSkipped("трек слишком длинный или недоступен")
     return mp3, info or {}
 
 
+def _download_best(entries: list[dict], out_dir: str) -> tuple[Path, dict, dict]:
+    """Пробует результаты по очереди. Если источник сломан, переходит к следующему."""
+    failed: set[str] = set()
+    last: Exception | None = None
+    for e in entries:
+        if e["_src"] in failed:
+            continue
+        d = e.get("duration")
+        if d and d > MAX_TRACK_DURATION:
+            continue
+        for p in Path(out_dir).glob("track.*"):
+            p.unlink(missing_ok=True)
+        try:
+            mp3, info = _download_mp3(entry_url(e), out_dir)
+            return mp3, info, e
+        except TrackSkipped as ex:
+            last = ex
+        except Exception as ex:
+            logging.warning("download failed (%s): %s", e["_src"], ex)
+            last = ex
+            failed.add(e["_src"])
+    raise last or RuntimeError("не нашёл подходящий трек")
+
+
+RESULTS: dict[str, str] = {}   # короткий ключ кнопки -> ссылка на трек
+
+
+def remember(e: dict) -> str:
+    key = uuid.uuid4().hex[:8]
+    RESULTS[key] = entry_url(e)
+    while len(RESULTS) > 1000:
+        RESULTS.pop(next(iter(RESULTS)))
+    return key
+
+
+async def send_alternatives(message: Message, entries: list[dict], used: dict | None) -> None:
+    alts = [e for e in entries if e is not used][:5]
+    if not alts:
+        return
+    b = InlineKeyboardBuilder()
+    for e in alts:
+        d = e.get("duration")
+        dur = f" ({int(d) // 60}:{int(d) % 60:02d})" if d else ""
+        title = (e.get("title") or "без названия")[:46]
+        b.row(InlineKeyboardButton(text=f"{ICON.get(e['_src'], '🎵')} {title}{dur}",
+                                   callback_data=f"dl:{remember(e)}"))
+    await message.answer("Не тот трек? Другие варианты (нажми, чтобы получить аудио):",
+                         reply_markup=b.as_markup())
+
+
 def links_block(artist: str, title: str) -> str:
+    from urllib.parse import quote_plus
     q = quote_plus(f"{artist} {title}".strip())
     return (
         f'🔗 <a href="https://open.spotify.com/search/{q}">Spotify</a> · '
@@ -330,22 +485,24 @@ async def recognize_track(path: Path) -> dict | None:
 
 
 async def deliver_recognized(message: Message, status: Message, track: dict) -> None:
-    """Показывает инфо о найденном треке и отправляет аудиофайл."""
+    """Показывает инфо о найденном треке и отправляет аудиофайл с обложкой."""
     info_text = format_track(track)
     title, artist = track.get("title", "Track"), track.get("subtitle", "")
     await status.edit_text(info_text + "\n\n⬇️ Скачиваю аудио...", disable_web_page_preview=True)
+    images = track.get("images") or {}
+    cover_url = images.get("coverarthq") or images.get("coverart")
     try:
-        video_id = await asyncio.to_thread(_find_video_id, f"{artist} - {title}")
-        if not video_id:
-            raise RuntimeError("не нашёл аудио")
+        entries = await asyncio.to_thread(_search, f"{artist} - {title}")
+        if not entries:
+            raise RuntimeError("не нашёл аудио в интернете")
         with tempfile.TemporaryDirectory() as tmp:
-            mp3, _ = await asyncio.to_thread(_download_mp3, video_id, tmp)
-            final = Path(tmp) / "final.mp3"
-            await retag(mp3, final, title, artist)
-            await send_mp3(message, final, title, artist)
-    except Exception:
+            mp3, info, _ = await asyncio.to_thread(_download_best, entries, tmp)
+            await finalize_and_send(message, tmp, mp3, title, artist,
+                                    cover_url or info.get("thumbnail"))
+    except Exception as e:
         logging.exception("deliver error")
-        await message.answer("⚠️ Песню нашёл, но скачать аудио не получилось. Попробуй позже.")
+        await message.answer("⚠️ Песню нашёл, но скачать аудио не получилось: "
+                             f"{html.escape(explain_error(e))}")
     await status.edit_text(info_text, disable_web_page_preview=True)
 
 
@@ -355,7 +512,7 @@ def start_kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.row(InlineKeyboardButton(text="🔎 Найти песню", callback_data="menu:search"))
     b.row(InlineKeyboardButton(text="🎛 Эффекты", callback_data="menu:fx"))
-    b.row(InlineKeyboardButton(text="🏷 Изменить теги", callback_data="menu:tags"))
+    b.row(InlineKeyboardButton(text="🏷 Теги и обложка", callback_data="menu:tags"))
     b.row(InlineKeyboardButton(text="📢 Пост в канал", callback_data="menu:post"))
     return b.as_markup()
 
@@ -365,9 +522,9 @@ async def start(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
         "Привет! Выбери функцию кнопкой ниже или просто пришли мне:\n\n"
-        "• <b>аудиофайл</b> — сделаю эффекты или поменяю теги\n"
+        "• <b>аудиофайл</b> — сделаю эффекты, поменяю теги и обложку\n"
         "• <b>голосовое, видео, кружок или ссылку</b> — найду песню и пришлю аудио\n"
-        "• <b>название</b> — поищу трек",
+        "• <b>название</b> — найду трек и пришлю аудио",
         reply_markup=start_kb(),
     )
 
@@ -389,8 +546,8 @@ async def on_menu(cb: CallbackQuery, state: FSMContext):
         await cb.message.answer("🎛 Пришли аудиофайл (mp3, m4a...), и я открою меню эффектов: "
                                 "speed up / slowed, reverb, 8D.")
     elif action == "tags":
-        await cb.message.answer("🏷 Пришли аудиофайл. В меню под ним будет кнопка «Изменить теги»: "
-                                "можно поменять только их, без эффектов.")
+        await cb.message.answer("🏷 Пришли аудиофайл. В меню под ним будут кнопки «Теги» и «Обложка»: "
+                                "их можно менять и без эффектов.")
     elif action == "post":
         await begin_post(cb.message, cb.from_user.id, state)
 
@@ -530,7 +687,7 @@ async def post_publish(cb: CallbackQuery, state: FSMContext, bot: Bot):
             "и что CHANNEL_ID указан верно.")
 
 
-# =====================  ВВОД ЗНАЧЕНИЙ (скорость / теги)  =====================
+# =====================  ВВОД ЗНАЧЕНИЙ (скорость / теги / обложка)  =====================
 
 @dp.message(Fx.custom_speed, F.text)
 async def on_custom_speed(message: Message, state: FSMContext):
@@ -565,9 +722,27 @@ async def on_tags_input(message: Message, state: FSMContext):
     await message.answer(menu_text(s), reply_markup=effects_kb(data["sid"], s))
 
 
+@dp.message(Fx.cover, F.photo | F.document.mime_type.startswith("image/"))
+async def on_cover_input(message: Message, state: FSMContext):
+    data = await state.get_data()
+    s = SESSIONS.get(data.get("sid"))
+    await state.clear()
+    if not s:
+        await message.reply("Сессия устарела, пришли файл заново.")
+        return
+    s.cover_file_id = message.photo[-1].file_id if message.photo else message.document.file_id
+    s.tags_changed = True
+    await message.answer(menu_text(s), reply_markup=effects_kb(data["sid"], s))
+
+
+@dp.message(Fx.cover, F.text)
+async def on_cover_wrong(message: Message):
+    await message.reply("Пришли картинку (как фото или файлом). Отмена: /cancel")
+
+
 # =====================  АВТООПРЕДЕЛЕНИЕ ТИПА СООБЩЕНИЯ  =====================
 
-# аудиофайл -> эффекты и теги
+# аудиофайл -> эффекты, теги, обложка
 @dp.message(F.audio | F.document.mime_type.startswith("audio/"))
 async def on_audio_file(message: Message, state: FSMContext):
     await state.clear()
@@ -613,7 +788,7 @@ async def on_media_recognize(message: Message, bot: Bot, state: FSMContext):
     await deliver_recognized(message, status, track)
 
 
-# текст: ссылка -> поиск песни, иначе поиск по названию
+# текст: ссылка -> поиск песни, иначе поиск по названию (сразу присылает аудио)
 @dp.message(F.text)
 async def on_text(message: Message):
     text = message.text.strip()
@@ -629,42 +804,48 @@ async def on_text(message: Message):
                 return
             await deliver_recognized(message, status, track)
             return
+    except Exception as e:
+        logging.exception("url error")
+        await status.edit_text(f"⚠️ Не получилось обработать ссылку: {html.escape(explain_error(e))}")
+        return
 
-        entries = await asyncio.to_thread(_search_youtube, text)
-        if not entries:
-            await status.edit_text("😕 Ничего не нашёл.")
-            return
-        b = InlineKeyboardBuilder()
-        for e in entries:
-            d = e.get("duration")
-            dur = f" ({int(d) // 60}:{int(d) % 60:02d})" if d else ""
-            b.row(InlineKeyboardButton(text=f"🎵 {e.get('title', 'без названия')[:48]}{dur}",
-                                       callback_data=f"dl:{e['id']}"))
-        await status.edit_text(f"🔎 Результаты по запросу <b>{html.escape(text)}</b>.\n"
-                               "Выбери трек, и я пришлю аудио:", reply_markup=b.as_markup())
-    except Exception:
-        logging.exception("text error")
-        await status.edit_text("⚠️ Что-то пошло не так. Проверь ссылку или попробуй позже.")
+    entries = await asyncio.to_thread(_search, text)
+    if not entries:
+        await status.edit_text("😕 Ничего не нашёл.")
+        return
+    await status.edit_text("⬇️ Нашёл, скачиваю аудио...")
+    used = None
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            mp3, info, used = await asyncio.to_thread(_download_best, entries, tmp)
+            title, artist = guess_tags(info)
+            await finalize_and_send(message, tmp, mp3, title, artist, info.get("thumbnail"))
+        await status.delete()
+    except Exception as e:
+        logging.exception("search download error")
+        await status.edit_text(f"⚠️ Не получилось скачать аудио: {html.escape(explain_error(e))}")
+    await send_alternatives(message, entries, used)
 
 
 # =====================  КНОПКИ: скачать трек / эффекты  =====================
 
 @dp.callback_query(F.data.startswith("dl:"))
 async def on_download(cb: CallbackQuery):
-    video_id = cb.data.split(":", 1)[1]
+    url = RESULTS.get(cb.data.split(":", 1)[1])
+    if not url:
+        await cb.answer("Результат устарел, повтори поиск", show_alert=True)
+        return
     await cb.answer("Скачиваю...")
     status = await cb.message.answer("⬇️ Скачиваю аудио...")
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            mp3, info = await asyncio.to_thread(_download_mp3, video_id, tmp)
+            mp3, info = await asyncio.to_thread(_download_mp3, url, tmp)
             title, artist = guess_tags(info)
-            final = Path(tmp) / "final.mp3"
-            await retag(mp3, final, title, artist)
-            await send_mp3(cb.message, final, title, artist)
+            await finalize_and_send(cb.message, tmp, mp3, title, artist, info.get("thumbnail"))
         await status.delete()
-    except Exception:
+    except Exception as e:
         logging.exception("download error")
-        await status.edit_text("⚠️ Не получилось скачать. Выбери другой трек или попробуй позже.")
+        await status.edit_text(f"⚠️ Не получилось скачать: {html.escape(explain_error(e))}")
 
 
 async def refresh_menu(cb: CallbackQuery, sid: str, s: Session) -> None:
@@ -706,9 +887,14 @@ async def on_fx(cb: CallbackQuery, bot: Bot, state: FSMContext):
             "Напиши новые теги в формате:\n<code>Исполнитель - Название</code>\n\n"
             f"Сейчас: {html.escape(s.artist or '—')} - {html.escape(s.title)}\n"
             "Если напишешь только название, исполнитель останется прежним.")
+    elif action == "cover":
+        await state.set_state(Fx.cover)
+        await state.update_data(sid=sid)
+        await cb.message.answer("🖼 Пришли картинку для обложки (фото или файл-изображение). "
+                                "Я обрежу её до квадрата и вставлю в трек.")
     elif action == "go":
         if not s.has_effects and not s.tags_changed:
-            await cb.answer("Выбери эффект или измени теги", show_alert=True)
+            await cb.answer("Выбери эффект или измени теги / обложку", show_alert=True)
             return
         await cb.answer()
         await render(cb, bot, sid, s)
@@ -720,14 +906,28 @@ async def render(cb: CallbackQuery, bot: Bot, sid: str, s: Session) -> None:
     await cb.message.edit_text("⏳ Обрабатываю, это может занять до минуты...")
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            src = Path(tmp) / "input"
+            tmp_dir = Path(tmp)
+            src = tmp_dir / "input"
             await bot.download(s.file_id, destination=src)
-            out = Path(tmp) / "result.mp3"
-            if s.has_effects:
-                await apply_effects(src, out, s)
-            else:                                   # только теги
-                await retag(src, out, s.title, s.artist, copy=(s.ext == ".mp3"))
-            ok = await send_mp3(cb.message, out, s.title, s.artist)
+            cover = thumb = None
+            if s.cover_file_id:
+                raw = tmp_dir / "cover_raw"
+                await bot.download(s.cover_file_id, destination=raw)
+                cover, thumb = await prepare_cover(raw, tmp_dir)
+            out = tmp_dir / "result.mp3"
+
+            async def build(keep: bool) -> None:
+                if s.has_effects:
+                    await apply_effects(src, out, s, cover, keep)
+                else:                                   # только теги и обложка
+                    await retag(src, out, s.title, s.artist, copy=(s.ext == ".mp3"),
+                                cover=cover, keep_cover=keep)
+
+            try:
+                await build(True)
+            except RuntimeError:                        # старая обложка файла могла помешать
+                await build(False)
+            ok = await send_mp3(cb.message, out, s.title, s.artist, thumb)
         if ok:
             await cb.message.edit_text("✅ Готово! Можешь выбрать другие эффекты:\n\n" + menu_text(s),
                                        reply_markup=effects_kb(sid, s))
